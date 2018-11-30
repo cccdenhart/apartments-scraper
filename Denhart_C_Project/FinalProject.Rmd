@@ -1,0 +1,332 @@
+---
+title: "Final Project Analysis"
+output: html_notebook
+---
+
+** Load packages
+```{r}
+library(mongolite) # for connecting with Mongo DB
+library(e1071) # for Naive Bayes
+library(hashmap) # for converting zipcodes to neighborhoods
+library(class) # for knn
+```
+
+** Utility functions
+```{r}
+custMad <- function(pred, actual) {
+  # returns the mad given the column of actual values and the column of the predicted values
+  # args:
+  # - Vector[double] pred; the predicted values from the model of the sale prices
+  # - double givenM; the mean of actual values the predicted values are compared to
+  # return double mad;
+  mad <- sum(abs(pred - actual)) / length(pred)
+  return(mad)
+}
+```
+
+STEP 1: LOAD DATA
+
+Load the proper collection stored in mongo
+```{r}
+mongo_conn <- mongo(collection = "apts", db = "apt_db")
+test_apts <- mongo_conn$find('{}')
+```
+
+Load all of the one bedroom apartments into a dataframe
+```{r}
+one_bed_conn <- mongo(collection = "one_beds", db = "apt_db")
+raw_one_beds <- one_bed_conn$find('{}')
+```
+
+Load all of the two bedroom apartments into a dataframe
+```{r}
+two_bed_conn <- mongo(collection = "two_beds", db = "apt_db")
+raw_two_beds <- two_bed_conn$find('{}')
+```
+
+Load all of the three bedroom apartments into a dataframe
+```{r}
+three_bed_conn <- mongo(collection = "three_beds", db = "apt_db")
+raw_three_beds <- three_bed_conn$find('{}')
+```
+
+Load all of the four and up bedroom apartments into a dataframe
+```{r}
+four_plus_conn <- mongo(collection = "four_up_beds", db = "apt_db")
+raw_four_beds <- four_plus_conn$find('{}')
+```
+
+STEP 2: APPEND AND CLEAN DATA
+
+Append dataframes for all bedrooms
+```{r}
+raw_apts <- do.call("rbind", list(raw_one_beds, raw_two_beds, raw_three_beds, raw_four_beds))
+```
+
+Clean apartment data
+```{r}
+apts <- raw_apts
+
+# convert availability to just months or AvailableNow
+apts$Available <- gsub('[[:digit:]]+', '', apts$Available)
+apts$Available <- gsub("AvailableNow", "Now", apts$Available)
+
+# alter column data types
+apts <- apts[-which(apts$Address=="Boston"),]
+apts$SqFt <- gsub("SqFt", "", apts$SqFt)
+apts$SqFt <- as.numeric(gsub(",", "", apts$SqFt))
+apts$Deposit <- as.numeric(gsub(",", "", apts$Deposit))
+apts$Rent <- as.numeric(apts$Rent)
+apts$Beds <- factor(apts$Beds)
+apts$Baths <- factor(apts$Baths)
+apts$Available <- factor(apts$Available)
+apts$LeaseLength <- factor(apts$LeaseLength)
+apts$City <- factor(apts$City)
+apts$State <- factor(apts$State)
+apts$Zip <- factor(apts$Zip)
+
+# expand address
+apts$Address <- gsub('([[:upper:]])', ' \\1', apts$Address)
+
+# change row names and order
+apts <- apts[,c("Address", "City", "State", "Zip", "Unit#", "Rent", "Beds", "Baths", "Available", "LeaseLength", "Deposit", "SqFt")]
+names(apts) <- c("Address", "City", "State", "Zip", "Unit", "Rent", "Beds", "Baths", "Available", "LeaseLength", "Deposit", "SqFt")
+```
+
+Remove obviously fake information based on industry knowledge / guessing
+This process is not done using formal outlier detection as it is possible that outliers are legitimate values
+```{r}
+# impute deposits that are less than $50 as NA
+apts$Deposit[apts$Deposit < 50] <- NA
+
+# impute SqFt where less than 50 or greater than 9950 as NA 
+apts$SqFt[apts$SqFt < 50 | apts$SqFt > 9950] <- NA
+```
+
+Explore the data
+```{r}
+summary(apts)
+```
+
+STEP 3: PREDICT SQUARE FOOTAGE USING A MULTIPLE REGRESSION
+
+View relationsips between square footage and other variables
+```{r}
+plot(apts$Rent, apts$SqFt)
+abline(lm(SqFt ~ Rent, apts))
+plot(apts$Beds, apts$SqFt)
+
+# as expected, both variables show strong positive correlation with SqFt, thus should be included in any model
+```
+
+Separate all apartments into those with SqFt info and those without
+```{r}
+rowsNa <- which(is.na(apts$SqFt))
+wSF <- apts[-rowsNa,]
+woSF <- apts[rowsNa,]
+```
+
+Run a linear regression to model SqFt as a function of rent, beds, and baths
+```{r}
+# address, city, state and unit were not included because they're essentially uniquely identifying
+# Used backwards elimination to remove Lease Length
+sqft_model <- lm(SqFt ~ Rent + Beds + Baths + Zip, data = wSF)
+summary(sqft_model)
+```
+
+Use the SqFt model to impute NAs in the SqFt column
+```{r}
+# create dataframe for apartments including imputed values and engineered fields
+# dataframe does not inlude the 'Deposit' fields because most values are missing and its information is irrelevant regardless becuase it is almost always the same as rent
+eng_apts <- apts[,!(names(apts) == "Deposit")]
+eng_apts$SqFt[which(is.na(eng_apts$SqFt))] <- predict(sqft_model, newdata = eng_apts[which(is.na(eng_apts$SqFt)),], type = "response")
+
+```
+
+Create a derived feature 'Size' that describes an apartment as 'small', 'average', or 'large'
+```{r}
+# for each number of beds:
+# find the lower and upper quartiles for sqft
+# if sqft is below the 1st quartile then it is 'small'
+# if sqft is between the 1st and 3rd quartile then it is 'average'
+# if sqft is greater than the 3rd quartile then it is 'large'
+
+sorted_beds <- sort(unique(eng_apts$Beds), decreasing = FALSE)
+eng_apts$Size <- NA
+for(bed in sorted_beds) {
+  next_sqft <- eng_apts$SqFt[which(eng_apts$Beds==bed)]
+  quart <- quantile(next_sqft, c(.25, .75), type = 1)
+  quart <- unname(quart)
+  eng_apts$Size[which(eng_apts$Beds==bed)] = sapply(eng_apts$SqFt[which(eng_apts$Beds==bed)], function(x) 
+  {if(x < quart[1]) {
+    return("Small")
+    } else if(x >= quart[1] & x <= quart[2]) {
+      return("Average")
+    } else if (x > quart[2]){
+      return("Large")
+    } else {
+      return(NA)
+    }})
+}
+eng_apts$Size <- factor(eng_apts$Size)
+```
+
+Create a derived feature 'Price' that describes an apartment as 'cheap', 'average', or 'expensive'
+```{r}
+# for each number of beds:
+# find the lower and upper quartiles for rent
+# if rent is below the 1st quartile then it is 'cheap'
+# if rent is between the 1st and 3rd quartile then it is 'average'
+# if rent is greater than the 3rd quartile then it is 'expensive'
+
+sorted_beds <- sort(unique(eng_apts$Beds), decreasing = FALSE)
+eng_apts$Price <- NA
+for(bed in sorted_beds) {
+  next_price <- eng_apts$Rent[which(eng_apts$Beds==bed)]
+  quart <- quantile(next_price, c(.25, .75), type = 1)
+  quart <- unname(quart)
+  eng_apts$Price[which(eng_apts$Beds==bed)] = sapply(eng_apts$Rent[which(eng_apts$Beds==bed)], function(x) 
+  {if(x < quart[1]) {
+    return("Cheap")
+    } else if(x >= quart[1] & x <= quart[2]) {
+      return("Average")
+    } else if (x > quart[2]){
+      return("Expensive")
+    } else {
+      return(NA)
+    }})
+}
+eng_apts$Price <- factor(eng_apts$Price)
+```
+
+STEP 3: PREDICT NEIGHBORHOOD OF EACH APARTMENT
+
+Generate a table of zip codes and their corresponding neighborhood taken from Boston public data
+This will be used for training and validation of the model
+```{r}
+zips <- read.csv("/Users/cccdenhart/Documents/DS4100_Workspace/FinalProject/boston-office-by-zipcode.csv")[,3:4]
+names(zips) <- c("Zip", "Neighborhood")
+
+# clean the zipcodes
+zips$Zip <- gsub(" ", "", zips$Zip)
+zips$Zip <- gsub("\\*", "", zips$Zip)
+
+# clean the neighborhoods
+zips$Neighborhood <- gsub("Boston ", "", zips$Neighborhood)
+zips$Neighborhood <- gsub("\\(", "", zips$Neighborhood)
+zips$Neighborhood <- gsub("\\)", "", zips$Neighborhood)
+zips$Neighborhood <- gsub("Roxbury Mission Hill", "Mission Hill", zips$Neighborhood)
+zips$Neighborhood <- gsub("Dorchester Uphams Corner", "Dorchester", zips$Neighborhood)
+zips$Neighborhood <- gsub("Dorchester Center Four Corners only", "Dorchester", zips$Neighborhood)
+zips$Neighborhood <- gsub("Dorchester Grove Hall", "Dorchester", zips$Neighborhood)
+zips$Neighborhood <- gsub("Dorchester Center excluding Four Corners", "Dorchester", zips$Neighborhood)
+zips$Neighborhood <- gsub("Faneuil Hall marketplace/ north end", "North End", zips$Neighborhood)
+zips$Neighborhood <- gsub("downtown crossing/ financial district", "Downtown", zips$Neighborhood)
+zips$Neighborhood <- gsub("Hanover Street north end", "North End", zips$Neighborhood)
+zips$Neighborhood <- gsub("Chinatown/ Tufts Medical", "Chinatown", zips$Neighborhood)
+zips$Neighborhood <- gsub("Boston", "Seaport", zips$Neighborhood)
+zips$Neighborhood <- gsub("South Seaport", "Seaport", zips$Neighborhood)
+zips$Neighborhood <- gsub("East Seaport", "East Boston", zips$Neighborhood)
+
+# clean the entire dataframe
+zips <- zips[-c(which(zips$Zip==""), which(zips$Zip=="Thiszipcodeiscoveredbytwoareaoffices.")),]
+extraZips <- data.frame(c("02118", "02145", "02119"), c("South End", "Somerville", "Roxbury"))
+names(extraZips) <- c("Zip", "Neighborhood")
+zips <- rbind(zips, extraZips)
+zips
+```
+
+Add a neighborhood column to the data frame
+```{r}
+eng_apts$Neighborhood <- NA
+find_neigh <- function(zip) {
+  neigh <- zips$Neighborhood[which(zips$Zip==zip)][1]
+  return(neigh)
+}
+eng_apts$Zip <- as.character(eng_apts$Zip)
+eng_apts$Neighborhood <- sapply(eng_apts$Zip, find_neigh)
+eng_apts$Neighborhood[which(eng_apts$Neighborhood=="character(0)")] <- NA
+eng_apts$Neighborhood <- factor(eng_apts$Neighborhood)
+names(eng_apts)
+```
+
+Get training and testing datasets from eng_apts to be used for a Naive-Bayes classifier
+```{r}
+nb_rows <- sample(x = nrow(eng_apts), size = nrow(eng_apts) * .6)
+nb_train <- eng_apts[nb_rows,c("Price", "Beds", "Baths", "Available", "LeaseLength", "Size", "Neighborhood")]
+nb_test <- eng_apts[-nb_rows,c("Price", "Beds", "Baths", "Available", "LeaseLength", "Size", "Neighborhood")]
+```
+
+Implement Naive-Bayes to predict an apartment's neighborhood using the training data
+```{r}
+nb_neighborhood <- naiveBayes(Neighborhood ~ ., data = nb_train)
+```
+
+Determine accuracy of the Naive-Bayes model using the testing data
+```{r}
+pred_test <- predict(nb_neighborhood, newdata = nb_test)
+nb_correct <- length(which(pred_test == nb_test$Neighborhood))
+nb_pct_corr <- nb_correct / nrow(nb_test)
+nb_pct_corr
+```
+
+Get training and testing datasets from eng_apts to be used for a KNN model
+```{r}
+knn_rows <- sample(x = nrow(eng_apts), size = nrow(eng_apts) * .6)
+knn_train <- eng_apts[knn_rows,c("Rent", "Beds", "Baths", "SqFt")]
+train_classes <- eng_apts[knn_rows, "Neighborhood"]
+knn_test <- eng_apts[-knn_rows,c("Rent", "Beds", "Baths", "SqFt")]
+test_classes <- eng_apts[-knn_rows, c("Neighborhood")]
+```
+
+Implement KNN to predict an apartment's neighborhood using the training data
+```{r}
+init_k <- floor(sqrt(nrow(eng_apts)))
+allK <- c((init_k-5):init_k,(init_k+1):(init_k+5))
+accuracies <- c()
+for(i in allK) {
+  pred <- knn(knn_train, knn_test, train_classes, k=i)
+  accuracy <- length(which(pred == test_classes)) / length(test_classes)
+  accuracies <- c(accuracies, accuracy)
+}
+
+opt_k <- allK[which(accuracies==max(accuracies))]
+knn_neighborhood <- knn(knn_train, knn_test, train_classes, k = opt_k)
+```
+
+Assess the accuracy of the KNN model using the testing data
+```{r}
+knn_correct <- length(which(knn_neighborhood==test_classes))
+knn_pct_corr <- knn_correct / nrow(knn_test)
+knn_pct_corr
+```
+
+Comparison of models
+```{r}
+# The two models produced very similarly poor results as they both were able to select only about 22% of correct neighborhoods.
+# This is likely due to the fact that neighborhoods cannot be well identified simply by rent prices and size of apartments.
+# For these models to be more acccurate, more data would have to be acquired about who posted the advertisement and who has responded to the advertisement
+```
+
+Predict rent price using a multiple regression
+```{r}
+rent_model <- lm(Rent ~ Zip + Beds + Baths + LeaseLength + SqFt, data = eng_apts)
+summary(rent_model )
+```
+
+Evaluation of rent model fit
+```{r}
+rent_data <- eng_apts[,c("Zip", "Beds", "Baths", "LeaseLength", "SqFt")]
+rent_data$LeaseLength[which(is.na(rent_data$LeaseLength))] <- 12
+rent_real <- eng_apts[,"Rent"]
+rent_pred <- predict(rent_model, rent_data)
+mad <- custMad(rent_pred, rent_real)
+mad
+```
+
+
+Export table as CSV
+```{r}
+write.csv(x = eng_apts, file = "/Users/cccdenhart/Documents/DS4100_Workspace/FinalProject/FinalTable.csv", row.names = F)
+```
+
