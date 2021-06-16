@@ -1,0 +1,2 @@
+# Apartments Scraper
+This project scrapes attributes of properties from Apartments.com.  Some accompanying analysis attempts to predict various features of an apartment using simple maching learning approaches.
